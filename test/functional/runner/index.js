@@ -14,6 +14,10 @@ chai.config.includeStack = true;
 chai.config.showDiff = true;
 chai.config.truncateThreshold = 0;
 
+function escape(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && Array.isArray(value) === false;
 }
@@ -23,24 +27,30 @@ function translateClientOptions(options) {
     if (key === 'readConcernLevel') {
       options.readConcern = { level: options.readConcernLevel };
       delete options[key];
-    } else if (key === 'auto_encrypt_opts') {
-      options.autoEncryption = {};
+    } else if (key === 'autoEncryptOpts') {
+      options.autoEncryption = Object.assign({}, options.autoEncryptOpts);;
 
-      if (options.auto_encrypt_opts.kms_providers) {
-        options.autoEncryption.kmsProviders = options.auto_encrypt_opts.kms_providers;
+      if (options.autoEncryptOpts.kmsProviders) {
+        delete options.kmsProviders;
+        options.autoEncryption.kmsProviders = options.autoEncryptOpts.kmsProviders;
 
-        if (options.autoEncryption.kmsProviders.aws) {
-          const awsProvider = options.autoEncryption.kmsProviders.aws;
+        const kmsProviders = options.autoEncryption.kmsProviders;
+        if (kmsProviders.aws) {
+          const awsProvider = kmsProviders.aws;
           awsProvider.accessKeyId = process.env.AWS_ACCESS_KEY_ID || 'NOT_PROVIDED';
           awsProvider.secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY || 'NOT_PROVIDED';
         }
+
+        if (kmsProviders.local && kmsProviders.local.key) {
+          const localKey = kmsProviders.local.key;
+          if (localKey._bsontype && localKey._bsontype === 'Binary' && localKey.sub_type === 0) {
+            // this is read in as BSON Binary subtype 0, extract the Buffer
+            kmsProviders.local.key = kmsProviders.local.key.buffer;
+          }
+        }
       }
 
-      if (options.auto_encrypt_opts.schema_map) {
-        options.autoEncryption.schemaMap = options.auto_encrypt_opts.schema_map;
-      }
-
-      delete options.auto_encrypt_opts;
+      delete options.autoEncryptOpts;
     }
   });
 
@@ -52,7 +62,7 @@ function gatherTestSuites(specPath) {
     .readdirSync(specPath)
     .filter(x => x.indexOf('.json') !== -1)
     .map(x =>
-      Object.assign(EJSON.parse(fs.readFileSync(`${specPath}/${x}`)), {
+      Object.assign(EJSON.parse(fs.readFileSync(`${specPath}/${x}`), { relaxed: true }), {
         name: path.basename(x, '.json')
       })
     );
@@ -170,7 +180,11 @@ function prepareDatabaseForSuite(suite, context) {
               throw err;
             }
           })
-          .then(() => dataKeysCollection.insert(suite.key_vault_data, { w: 'majority' }));
+          .then(() => {
+            if (suite.key_vault_data.length) {
+              return dataKeysCollection.insertMany(suite.key_vault_data, { w: 'majority' });
+            }
+          });
       }
     })
     .then(() => {
@@ -183,7 +197,7 @@ function prepareDatabaseForSuite(suite, context) {
     })
     .then(() => {
       if (suite.data && Array.isArray(suite.data) && suite.data.length > 0) {
-        return coll.insert(suite.data, { w: 'majority' });
+        return coll.insertMany(suite.data, { w: 'majority' });
       }
     })
     .then(() => {
@@ -208,6 +222,8 @@ function parseSessionOptions(options) {
   return result;
 }
 
+const IGNORED_COMMANDS = new Set(['ismaster']);
+
 let displayCommands = false;
 function runTestSuiteTest(configuration, spec, context) {
   const commandEvents = [];
@@ -220,18 +236,24 @@ function runTestSuiteTest(configuration, spec, context) {
   clientOptions.haInterval = 100;
   clientOptions.useRecoveryToken = true;
 
+  // TODO: this should be configured by `newClient` and env variables
+  clientOptions.useUnifiedTopology = true;
+
   const url = resolveConnectionString(configuration, spec);
   const client = configuration.newClient(url, clientOptions);
   return client.connect().then(client => {
     context.testClient = client;
     client.on('commandStarted', event => {
-      if (event.databaseName === context.dbName || isTransactionCommand(event.commandName)) {
-        commandEvents.push(event);
+      if (IGNORED_COMMANDS.has(event.commandName)) {
+        return;
+      }
 
-        // very useful for debugging
-        if (displayCommands) {
-          console.dir(event, { depth: 5 });
-        }
+      // if (event.databaseName === context.dbName || isTransactionCommand(event.commandName)) {
+      commandEvents.push(event);
+
+      // very useful for debugging
+      if (displayCommands) {
+        console.dir(event, { depth: 5 });
       }
     });
 
@@ -256,6 +278,7 @@ function runTestSuiteTest(configuration, spec, context) {
 
     const operationContext = {
       database,
+      collectionName: context.collectionName,
       session0,
       session1,
       testRunner: context
@@ -288,7 +311,7 @@ function validateOutcome(testData, testContext) {
         .find({}, { readPreference: 'primary', readConcern: { level: 'local' } })
         .toArray()
         .then(docs => {
-          expect(docs).to.eql(testData.outcome.collection.data);
+          expect(docs).to.matchTransactionSpec(testData.outcome.collection.data);
         });
     }
   }
@@ -306,7 +329,9 @@ function validateExpectations(commandEvents, spec, savedSessionData) {
       const actual = actualEvents[idx];
 
       expect(actual.commandName).to.equal(expected.commandName);
-      expect(actual.databaseName).to.equal(expected.databaseName);
+      if (expected.databaseName) {
+        expect(actual.databaseName).to.equal(expected.databaseName);
+      }
 
       const actualCommand = actual.command;
       const expectedCommand = expected.command;
@@ -320,11 +345,14 @@ function validateExpectations(commandEvents, spec, savedSessionData) {
 function normalizeCommandShapes(commands) {
   return commands.map(command =>
     JSON.parse(
-      EJSON.stringify({
-        command: command.command,
-        commandName: command.command_name ? command.command_name : command.commandName,
-        databaseName: command.database_name ? command.database_name : command.databaseName
-      })
+      EJSON.stringify(
+        {
+          command: command.command,
+          commandName: command.command_name ? command.command_name : command.commandName,
+          databaseName: command.database_name ? command.database_name : command.databaseName
+        },
+        { relaxed: true }
+      )
     )
   );
 }
@@ -388,7 +416,7 @@ function normalizeReadPreference(mode) {
 function testOperation(operation, obj, context, options) {
   options = options || { swallowOperationErrors: true };
   const opOptions = {};
-  const args = [];
+  let args = [];
   const operationName = translateOperationName(operation.name);
 
   if (operation.arguments) {
@@ -401,6 +429,10 @@ function testOperation(operation, obj, context, options) {
       }
 
       if (['filter', 'fieldName', 'document', 'documents', 'pipeline'].indexOf(key) !== -1) {
+        return args.unshift(operation.arguments[key]);
+      }
+
+      if ((key === 'map' || key === 'reduce') && operationName === 'mapReduce') {
         return args.unshift(operation.arguments[key]);
       }
 
@@ -495,7 +527,7 @@ function testOperation(operation, obj, context, options) {
           }
 
           if (operation.result.errorContains) {
-            expect(err).to.match(new RegExp(errorContains, 'i'));
+            expect(err.message).to.match(new RegExp(escape(errorContains), 'i'));
           }
 
           if (errorCodeName) {
@@ -510,7 +542,7 @@ function testOperation(operation, obj, context, options) {
 
     return opPromise.then(opResult => {
       const actual = extractCrudResult(opResult, operation);
-      expect(actual).to.eql(operation.result);
+      expect(actual).to.matchTransactionSpec(operation.result);
     });
   }
 
@@ -534,22 +566,19 @@ function testOperations(testData, operationContext, options) {
   options = options || { swallowOperationErrors: true };
   return testData.operations.reduce((combined, operation) => {
     return combined.then(() => {
-      if (operation.object === 'collection') {
+      const object = operation.object || 'collection';
+      if (object === 'collection') {
         const db = operationContext.database;
+        const collectionName = operationContext.collectionName;
         const collectionOptions = operation.collectionOptions || {};
 
-        operationContext[operation.object] = db.collection(
-          'test',
+        operationContext[object] = db.collection(
+          collectionName,
           convertCollectionOptions(collectionOptions)
         );
       }
 
-      return testOperation(
-        operation,
-        operationContext[operation.object],
-        operationContext,
-        options
-      );
+      return testOperation(operation, operationContext[object], operationContext, options);
     });
   }, Promise.resolve());
 }
