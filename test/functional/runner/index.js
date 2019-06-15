@@ -105,7 +105,10 @@ function shouldSkipTest(spec) {
     'commitTransaction retry succeeds on new mongos',
     'commitTransaction retry fails on new mongos',
     'unpin after transient error within a transaction and commit',
-    'count'
+    'count',
+
+    // we do update validation before the expectation in this test
+    'an invalid update \(no \$ operators\) is validated and errors' // eslint-disable-line
   ];
 
   if (spec.skipReason || SKIP_TESTS.indexOf(spec.description) !== -1) {
