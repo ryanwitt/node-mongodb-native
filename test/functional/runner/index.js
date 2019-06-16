@@ -108,7 +108,10 @@ function shouldSkipTest(spec) {
     'count',
 
     // we do update validation before the expectation in this test
-    'an invalid update \(no \$ operators\) is validated and errors' // eslint-disable-line
+    'an invalid update \(no \$ operators\) is validated and errors', // eslint-disable-line
+
+    // the runner can't support this case because setup does too many things required by MDB >= 3.6
+    'operation fails with maxWireVersion < 8'
   ];
 
   if (spec.skipReason || SKIP_TESTS.indexOf(spec.description) !== -1) {
