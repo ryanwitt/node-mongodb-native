@@ -39,7 +39,7 @@ title = "Upgrade Guide"
 
 Key features of the 2.3 driver include:
 
-- Implements [Decimal128](https://docs.mongodb.org), a decimal
+- Implements [Decimal128](https://docs.mongodb.com/manual/release-notes/3.4/#decimal-type), a decimal
   floating-point numbering format that occupies 16 bytes (128 bits).
   See the
   [CRUD tutorial]({{< relref "tutorials/crud.md#specify-a-data-type" >}})
